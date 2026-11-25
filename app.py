@@ -1,6 +1,5 @@
 import io
 import re
-import cv2
 import fitz  # PyMuPDF for PDF uploads
 import numpy as np
 from PIL import Image, ImageDraw
@@ -41,6 +40,55 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
     draw.text((xd + 8, (y1 + y2) // 2 - 6), text, fill=color)
 
 
+def find_boxes_no_cv2(pil_img):
+  """Finds main rectangular boundary boxes using pure NumPy without OpenCV."""
+  gray = np.array(pil_img.convert("L"))
+  dark = gray < 180
+  h, w = dark.shape
+  visited = np.zeros_like(dark, dtype=bool)
+  boxes = []
+
+  # Downsample by 4x for fast pure-Python connected-component scan
+  step = 4
+  small = dark[::step, ::step]
+  sh, sw = small.shape
+  vis = np.zeros_like(small, dtype=bool)
+
+  for y in range(sh):
+    for x in range(sw):
+      if small[y, x] and not vis[y, x]:
+        stack = [(y, x)]
+        vis[y, x] = True
+        min_x = max_x = x
+        min_y = max_y = y
+        while stack:
+          cy, cx = stack.pop()
+          if cx < min_x:
+            min_x = cx
+          if cx > max_x:
+            max_x = cx
+          if cy < min_y:
+            min_y = cy
+          if cy > max_y:
+            max_y = cy
+          for ny, nx in (
+              (cy - 1, cx),
+              (cy + 1, cx),
+              (cy, cx - 1),
+              (cy, cx + 1),
+          ):
+            if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not vis[ny, nx]:
+              vis[ny, nx] = True
+              stack.append((ny, nx))
+        bw = (max_x - min_x) * step
+        bh = (max_y - min_y) * step
+        if bw > 80 and bh > 40 and bw < w * 0.95:
+          boxes.append((min_x * step, min_y * step, bw, bh))
+
+  boxes.sort(key=lambda b: b[1])  # Sort top-to-bottom
+  return boxes
+
+
 uploaded_file = st.file_uploader(
     "Upload Site Plan (JPG, PNG, WEBP, or PDF)",
     type=["jpg", "jpeg", "png", "webp", "pdf"],
@@ -49,33 +97,28 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
   file_bytes = uploaded_file.read()
 
-  # Convert PDF page 1 or standard image into OpenCV format
+  # Convert PDF page 1 or standard image into Pillow RGB format
   if uploaded_file.name.lower().endswith(".pdf"):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     pix = doc.load_page(0).get_pixmap(dpi=150)
-    img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-        pix.height, pix.width, pix.n
-    )
-    img_cv = cv2.cvtColor(
-        img_array, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR
-    )
+    pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
   else:
-    np_arr = np.asarray(bytearray(file_bytes), dtype=np.uint8)
-    img_cv = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
   # Resize large images so free hosting never runs out of memory
-  h, w = img_cv.shape[:2]
+  w, h = pil_img.size
   if w > 1200:
-    img_cv = cv2.resize(img_cv, (1200, int(h * (1200 / w))))
+    pil_img = pil_img.resize((1200, int(h * (1200 / w))))
 
   col1, col2 = st.columns(2)
   with col1:
     st.subheader("Uploaded Plan")
-    st.image(img_cv, channels="BGR", use_container_width=True)
+    st.image(pil_img, use_container_width=True)
 
-  # --- AUTOMATIC EXTRACTION (OpenCV + RapidOCR) ---
+  # --- AUTOMATIC EXTRACTION (RapidOCR + Pure NumPy) ---
   with st.spinner("Reading dimensions and detecting boundary polygons..."):
-    ocr_results, _ = ocr(img_cv)
+    img_np = np.array(pil_img)
+    ocr_results, _ = ocr(img_np)
     dimensions = []
     if ocr_results:
       for item in ocr_results:
@@ -90,18 +133,7 @@ if uploaded_file:
             cy = int((bbox[0][1] + bbox[2][1]) / 2)
             dimensions.append({"val": val, "x": cx, "y": cy})
 
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    boxes = []
-    for c in contours:
-      bx, by, bw, bh = cv2.boundingRect(c)
-      if bw > 80 and bh > 40:
-        boxes.append((bx, by, bw, bh))
-    boxes.sort(key=lambda b: b[1])  # Sort top-to-bottom
+    boxes = find_boxes_no_cv2(pil_img)
 
   # Default fallback values
   adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 4.0, 1.5, 2.0
@@ -158,7 +190,7 @@ if uploaded_file:
           "Separation Gap (m)", value=float(gap), min_value=0.1, step=0.1
       )
 
-    # Auto-calculate scale so the drawing always fits neatly on an 800x800 canvas
+    # Auto-calculate scale so the drawing fits neatly on an 800x800 canvas
     total_w_m = max(adj_w, rem_w) if has_remote else adj_w
     total_h_m = (adj_d + gap + rem_d) if has_remote else adj_d
     scale = min(520 / total_w_m, 520 / total_h_m)
