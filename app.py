@@ -40,6 +40,16 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
     draw.text((xd + 8, (y1 + y2) // 2 - 6), text, fill=color)
 
 
+def box_area(box):
+  bx, by, bw, bh = box
+  return bw * bh
+
+
+def box_top_y(box):
+  bx, by, bw, bh = box
+  return by
+
+
 def detect_cafe_rectangles(img_cv):
   """Finds distinct rectangular zones (ignoring outer page borders and tiny clutter)."""
   h, w = img_cv.shape[:2]
@@ -64,8 +74,8 @@ def detect_cafe_rectangles(img_cv):
     if 4 <= len(approx) <= 6 and bw > 50 and bh > 30:
       raw_boxes.append((bx, by, bw, bh))
 
-  # Sort largest area first to filter out duplicate inner/outer contour lines
-  raw_boxes.sort(key=lambda item: item * item, reverse=True)
+  # Sort largest area first to remove duplicate inner/outer walls of same box
+  raw_boxes.sort(key=box_area, reverse=True)
   unique_boxes = []
   for bx, by, bw, bh in raw_boxes:
     is_dup = False
@@ -82,7 +92,7 @@ def detect_cafe_rectangles(img_cv):
       unique_boxes.append((bx, by, bw, bh))
 
   # Sort top-to-bottom by Y coordinate
-  unique_boxes.sort(key=lambda item: item)
+  unique_boxes.sort(key=box_top_y)
   return unique_boxes
 
 
@@ -129,11 +139,10 @@ if uploaded_file:
           if val > 100:
             val /= 1000.0
           if 0.2 <= val <= 50.0:
-            xs = [pt for pt in bbox]
-            ys = [pt for pt in bbox]
-            cx = int((min(xs) + max(xs)) / 2)
-            cy = int((min(ys) + max(ys)) / 2)
-            dimensions.append({"val": round(val, 2), "x": cx, "y": cy})
+            center_x, center_y = np.array(bbox, dtype=float).mean(axis=0)
+            dimensions.append(
+                {"val": round(val, 2), "x": int(center_x), "y": int(center_y)}
+            )
 
     boxes = detect_cafe_rectangles(img_cv)
 
@@ -152,7 +161,7 @@ if uploaded_file:
 
     if len(boxes) >= 2:
       has_remote = True
-      rx, ry, rw, rh = boxes
+      rx, ry, rw, rh = next(iter(boxes))
       rem_w = min(
           dimensions,
           key=lambda d: (d["x"] - (rx + rw / 2)) ** 2 + (d["y"] - ry) ** 2,
