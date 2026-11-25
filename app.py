@@ -46,11 +46,9 @@ def detect_cafe_rectangles(img_cv):
   page_area = h * w
   gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
   blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-  # Adaptive threshold catches both dark ink and lighter pencil/scan lines
   thresh = cv2.adaptiveThreshold(
       blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
   )
-  # Close small gaps in hand-drawn rectangle corners
   kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
   closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
@@ -63,12 +61,11 @@ def detect_cafe_rectangles(img_cv):
     peri = cv2.arcLength(c, True)
     approx = cv2.approxPolyDP(c, 0.04 * peri, True)
     bx, by, bw, bh = cv2.boundingRect(approx)
-    # Keep roughly rectangular shapes (4 to 6 vertices) of reasonable size
     if 4 <= len(approx) <= 6 and bw > 50 and bh > 30:
       raw_boxes.append((bx, by, bw, bh))
 
-  # Remove duplicate overlapping boxes (inner/outer wall of same rectangle)
-  raw_boxes.sort(key=lambda b: b * b, reverse=True)
+  # Sort largest area first to filter out duplicate inner/outer contour lines
+  raw_boxes.sort(key=lambda item: item * item, reverse=True)
   unique_boxes = []
   for bx, by, bw, bh in raw_boxes:
     is_dup = False
@@ -85,7 +82,7 @@ def detect_cafe_rectangles(img_cv):
       unique_boxes.append((bx, by, bw, bh))
 
   # Sort top-to-bottom by Y coordinate
-  unique_boxes.sort(key=lambda b: b)
+  unique_boxes.sort(key=lambda item: item)
   return unique_boxes
 
 
@@ -104,7 +101,6 @@ if uploaded_file:
   else:
     pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-  # Resize to ~1400px wide for sharp handwriting detail without hitting RAM limits
   w, h = pil_img.size
   if w > 1400:
     pil_img = pil_img.resize((1400, int(h * (1400 / w))))
@@ -115,7 +111,6 @@ if uploaded_file:
     st.image(pil_img, use_container_width=True)
 
   with st.spinner("Reading dimensions and detecting boundary polygons..."):
-    # Boost contrast & sharpness to help OCR read handwritten numbers
     enhanced = ImageEnhance.Contrast(pil_img).enhance(1.8)
     enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.5)
     img_np = np.array(enhanced)
@@ -126,27 +121,26 @@ if uploaded_file:
     if ocr_results:
       for item in ocr_results:
         bbox, text, _ = item
-        # Clean common handwriting OCR confusions (e.g. 'O' -> '0', ',' -> '.')
         clean_text = (
             str(text).replace(",", ".").replace("O", "0").replace("o", "0")
         )
         for match in re.finditer(r"(\d+\.?\d*)", clean_text):
           val = float(match.group(1))
-          if val > 100:  # Convert mm (e.g. 4500) to meters (4.5)
+          if val > 100:
             val /= 1000.0
           if 0.2 <= val <= 50.0:
-           ```python
-   cx = int((bbox[0][0] + bbox[2][0]) / 2)
-   cy = int((bbox[0][1] + bbox[2][1]) / 2)
+            xs = [pt for pt in bbox]
+            ys = [pt for pt in bbox]
+            cx = int((min(xs) + max(xs)) / 2)
+            cy = int((min(ys) + max(ys)) / 2)
             dimensions.append({"val": round(val, 2), "x": cx, "y": cy})
 
     boxes = detect_cafe_rectangles(img_cv)
 
-  # Default fallback values
   adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 4.0, 1.5, 2.0
 
   if boxes and dimensions:
-    bx, by, bw, bh = boxes[-1]  # Bottom box = Adjacent PC
+    bx, by, bw, bh = boxes[-1]
     adj_w = min(
         dimensions,
         key=lambda d: (d["x"] - (bx + bw / 2)) ** 2 + (d["y"] - by) ** 2,
@@ -158,7 +152,7 @@ if uploaded_file:
 
     if len(boxes) >= 2:
       has_remote = True
-      rx, ry, rw, rh = boxes  # Top box = Remote PC
+      rx, ry, rw, rh = boxes
       rem_w = min(
           dimensions,
           key=lambda d: (d["x"] - (rx + rw / 2)) ** 2 + (d["y"] - ry) ** 2,
