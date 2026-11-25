@@ -51,12 +51,12 @@ def box_top_y(box):
 
 
 def detect_cafe_rectangles(img_cv, dimensions):
-    """Detects Pavement Cafe zones, merges split C-shapes, and filters out dimension arrows."""
+    """Finds actual pavement cafe zones while filtering out dimension arrow boxes."""
     h, w = img_cv.shape[:2]
     page_area = h * w
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
-    # Normalize warm phone photo shadows
+    # Normalize uneven paper lighting so pencil/pen strokes have uniform contrast
     bg = cv2.GaussianBlur(gray, (51, 51), 0)
     norm = cv2.divide(gray, bg, scale=255)
     blurred = cv2.GaussianBlur(norm, (5, 5), 0)
@@ -65,106 +65,104 @@ def detect_cafe_rectangles(img_cv, dimensions):
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
     )
 
-    # Light closing to keep distinct walls separate from dimension arrows
+    # Pass 1: Light closing to detect intact zones like the Remote PC
     k_light = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_light)
+    closed_light = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_light)
+
+    # Pass 2: Horizontal-only closing to bridge customer entrance openings without merging vertically
+    k_horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (max(35, int(w * 0.14)), 3))
+    closed_horiz = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_horiz)
 
     raw_boxes = []
-
-    # 1. Connected components catch open C-shaped zones cleanly
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(closed)
-    for idx in range(1, num_labels):
-        bx = int(stats[idx, cv2.CC_STAT_LEFT])
-        by = int(stats[idx, cv2.CC_STAT_TOP])
-        bw = int(stats[idx, cv2.CC_STAT_WIDTH])
-        bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
-        area = bw * bh
-        # Reject thin arrow strips (bh < 65 or bw < 65) and huge page borders
-        if bw >= 65 and bh >= 65 and (page_area * 0.002) <= area <= (page_area * 0.45):
-            raw_boxes.append((bx, by, bw, bh))
-
-    # 2. Contours catch closed rectangles
-    contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < (page_area * 0.002) or area > (page_area * 0.45):
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-        bx, by, bw, bh = cv2.boundingRect(approx)
-        rect_fill = area / float(bw * bh) if (bw * bh) > 0 else 0
-        if 4 <= len(approx) <= 8 and bw >= 65 and bh >= 65 and rect_fill > 0.55:
-            raw_boxes.append((bx, by, bw, bh))
-
-    # Filter out any box that wraps around a dimension arrow + red OCR text dot
-    clean_boxes = []
-    for bx, by, bw, bh in raw_boxes:
-        has_ocr_inside = False
-        for d in dimensions:
-            if (bx + 10) <= d["x"] <= (bx + bw - 10) and (by + 10) <= d["y"] <= (by + bh - 10):
-                has_ocr_inside = True
-                break
-        if not has_ocr_inside:
-            clean_boxes.append((bx, by, bw, bh))
-
-    # Merge boxes that sit on the same horizontal row (unites left & right halves of a C-shaped zone)
-    merged = True
-    while merged:
-        merged = False
-        next_boxes = []
-        used = [False] * len(clean_boxes)
-        for i in range(len(clean_boxes)):
-            if used[i]:
+    for mask in (closed_light, closed_horiz):
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < (page_area * 0.004) or area > (page_area * 0.45):
                 continue
-            bx, by, bw, bh = clean_boxes[i]
-            for j in range(i + 1, len(clean_boxes)):
-                if used[j]:
-                    continue
-                ux, uy, uw, uh = clean_boxes[j]
-                y_overlap = max(0, min(by + bh, uy + uh) - max(by, uy))
-                min_h = min(bh, uh)
-                # Same horizontal band (vertical overlap > 65%) and horizontally overlapping or within 180px gap
-                x_gap = max(bx, ux) - min(bx + bw, ux + uw)
-                if min_h > 0 and (y_overlap / float(min_h)) > 0.65 and x_gap < 180:
-                    nx0 = min(bx, ux)
-                    ny0 = min(by, uy)
-                    nx1 = max(bx + bw, ux + uw)
-                    ny1 = max(by + bh, uy + uh)
-                    bx, by, bw, bh = nx0, ny0, nx1 - nx0, ny1 - ny0
-                    used[j] = True
-                    merged = True
-            next_boxes.append((bx, by, bw, bh))
-        clean_boxes = next_boxes
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+            bx, by, bw, bh = cv2.boundingRect(approx)
+            rect_fill = area / float(bw * bh) if (bw * bh) > 0 else 0
+            # Require reasonable height (at least 7% of page height) so thin horizontal arrow boxes are excluded
+            if bw > int(w * 0.10) and bh > int(h * 0.07) and rect_fill > 0.65:
+                # Discard any box that contains an OCR dimension dot inside its interior (walkway/arrow frame)
+                has_text_inside = any(
+                    (bx + 15) < d["x"] < (bx + bw - 15) and (by + 15) < d["y"] < (by + bh - 15)
+                    for d in dimensions
+                )
+                if not has_text_inside:
+                    raw_boxes.append((bx, by, bw, bh))
 
-    # Remove any outer container box that encloses another distinct zone
-    final_boxes = []
-    for i, (bx, by, bw, bh) in enumerate(clean_boxes):
-        encloses_other = False
-        for j, (ox, oy, ow, oh) in enumerate(clean_boxes):
+    # Deduplicate overlapping boxes
+    raw_boxes.sort(key=box_area, reverse=True)
+    unique_boxes = []
+    for bx, by, bw, bh in raw_boxes:
+        is_dup = False
+        for ux, uy, uw, uh in unique_boxes:
+            inter_x1 = max(bx, ux)
+            inter_y1 = max(by, uy)
+            inter_x2 = min(bx + bw, ux + uw)
+            inter_y2 = min(by + bh, uy + uh)
+            if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                if inter_area > 0.50 * min(bw * bh, uw * uh):
+                    is_dup = True
+                    break
+        if not is_dup:
+            unique_boxes.append((bx, by, bw, bh))
+
+    # Remove any outer container box that encloses smaller boxes
+    inner_boxes = []
+    for i, (bx, by, bw, bh) in enumerate(unique_boxes):
+        contains_others = 0
+        for j, (ox, oy, ow, oh) in enumerate(unique_boxes):
             if i != j and bx <= ox + 10 and by <= oy + 10 and (bx + bw) >= (ox + ow - 10) and (by + bh) >= (oy + oh - 10):
-                encloses_other = True
-                break
-        if not encloses_other:
-            final_boxes.append((bx, by, bw, bh))
+                contains_others += 1
+        if contains_others == 0:
+            inner_boxes.append((bx, by, bw, bh))
 
-    final_boxes.sort(key=box_top_y)
-    return final_boxes
+    # Merge split horizontal halves on the same row (e.g., C-shaped Adjacent PC with wide entrance)
+    inner_boxes.sort(key=box_top_y)
+    merged_boxes = []
+    for bx, by, bw, bh in inner_boxes:
+        merged = False
+        for idx, (mx, my, mw, mh) in enumerate(merged_boxes):
+            if abs(by - my) < 35 and abs((by + bh) - (my + mh)) < 35:
+                nx = min(bx, mx)
+                ny = min(by, my)
+                nw = max(bx + bw, mx + mw) - nx
+                nh = max(by + bh, my + mh) - ny
+                # Only merge if the merged box still has no OCR text inside it
+                has_text_inside = any(
+                    (nx + 15) < d["x"] < (nx + nw - 15) and (ny + 15) < d["y"] < (ny + nh - 15)
+                    for d in dimensions
+                )
+                if not has_text_inside:
+                    merged_boxes[idx] = (nx, ny, nw, nh)
+                    merged = True
+                    break
+        if not merged:
+            merged_boxes.append((bx, by, bw, bh))
+
+    merged_boxes.sort(key=box_top_y)
+    return merged_boxes
 
 
 def extract_dimensions(pil_img):
-    """Dual-pass OCR with handwriting normalization and arrow-artifact filtering."""
+    """Dual-pass OCR to reliably read handwritten dimensions."""
+    dimensions = []
+
     enhanced = ImageEnhance.Contrast(pil_img).enhance(1.9)
     enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.6)
-    img_np = np.array(enhanced)
 
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    gray = np.array(pil_img.convert("L"))
     bg = cv2.GaussianBlur(gray, (51, 51), 0)
-    norm_gray = cv2.divide(gray, bg, scale=255)
-    norm_rgb = cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2RGB)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm_rgb = cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB)
 
-    dimensions = []
-    for pass_img in (img_np, norm_rgb):
-        ocr_results, _ = ocr(pass_img)
+    for img_np in (np.array(enhanced), norm_rgb):
+        ocr_results, _ = ocr(img_np)
         if not ocr_results:
             continue
         for item in ocr_results:
@@ -179,46 +177,51 @@ def extract_dimensions(pil_img):
                 .replace("s", "5")
             )
             pts = np.array(bbox, dtype=float)
-            box_w = float(pts[:, 0].max() - pts[:, 0].min())
-            box_h = float(pts[:, 1].max() - pts[:, 1].min())
-            if box_w > 0 and (box_h / box_w) > 2.3:
+            box_w = pts[:, 0].max() - pts[:, 0].min()
+            box_h = pts[:, 1].max() - pts[:, 1].min()
+            if box_w > 0 and (box_h / box_w) > 2.2:
                 continue
 
             for match in re.finditer(r"(\d+\.?\d*)", clean_text):
-                num_str = match.group(1)
-                val = float(num_str)
+                raw_num = match.group(1)
+                val = float(raw_num)
                 if val > 100:
                     val /= 1000.0
-                if val == 1.0 and not has_unit:
+                if "." not in raw_num:
+                    nearest_int = round(val)
+                    if abs(val - nearest_int) <= 0.45:
+                        val = float(nearest_int)
+                if not has_unit and val == 1.0:
                     continue
-                if "." not in num_str and val < 20:
-                    val = float(round(val))
                 if 0.4 <= val <= 50.0:
-                    cx = int(pts[:, 0].mean())
-                    cy = int(pts[:, 1].mean())
-                    if not any(abs(d["x"] - cx) < 25 and abs(d["y"] - cy) < 25 for d in dimensions):
+                    center_x, center_y = pts.mean(axis=0)
+                    cx, cy = int(center_x), int(center_y)
+                    is_dup = any(
+                        abs(d["x"] - cx) < 25 and abs(d["y"] - cy) < 25
+                        for d in dimensions
+                    )
+                    if not is_dup:
                         dimensions.append({
                             "val": round(val, 2),
                             "x": cx,
                             "y": cy,
                             "has_unit": has_unit,
+                            "used": False,
                         })
     return dimensions
 
 
-def pick_best_dimension(candidates, target_x, target_y, used_indices):
-    best_idx = None
-    best_score = float("inf")
-    for idx, d in candidates:
-        if idx in used_indices:
-            continue
-        dist = ((d["x"] - target_x) ** 2 + (d["y"] - target_y) ** 2) ** 0.5
-        if d.get("has_unit"):
-            dist -= 60.0
-        if dist < best_score:
-            best_score = dist
-            best_idx = idx
-    return best_idx
+def claim_best(candidates, target_x, target_y):
+    unused = [d for d in candidates if not d["used"]]
+    if not unused:
+        return None
+    best = min(
+        unused,
+        key=lambda d: ((d["x"] - target_x) ** 2 + (d["y"] - target_y) ** 2) ** 0.5
+        - (60 if d["has_unit"] else 0),
+    )
+    best["used"] = True
+    return best["val"]
 
 
 uploaded_file = st.file_uploader(
@@ -247,7 +250,7 @@ if uploaded_file:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Uploaded Plan & Detection Overlay")
+        st.subheader("Uploaded Plan & Detection Check")
         debug_img = pil_img.copy()
         debug_draw = ImageDraw.Draw(debug_img)
         for idx, (bx, by, bw, bh) in enumerate(boxes):
@@ -259,102 +262,89 @@ if uploaded_file:
         st.caption("Green boxes = detected PC zones | Red dots = numbers read by OCR")
 
     adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 4.0, 1.5, 2.0
-    used_dims = set()
 
     if boxes and dimensions:
-        indexed_dims = list(enumerate(dimensions))
-        bx, by, bw, bh = boxes[-1]  # Bottom box = Adjacent PC
-
         if len(boxes) >= 2:
             has_remote = True
-            rx, ry, rw, rh = next(iter(boxes))  # Top box = Remote PC
-            left_bound = min(bx, rx)
-            right_bound = max(bx + bw, rx + rw)
+            rx, ry, rw, rh = boxes[0]
+            bx, by, bw, bh = boxes[-1]
 
-            # 1. Claim Clear Gap along left or right outer margin between the two zones
+            # 1. Clear Gap: strictly in outer left/right margin vertically between Remote PC and Adjacent PC
             gap_candidates = [
-                (i, d) for i, d in indexed_dims
-                if (ry + rh - 20) <= d["y"] <= (by + 20)
-                and (d["x"] <= left_bound + 45 or d["x"] >= right_bound - 45)
+                d for d in dimensions
+                if (ry + rh - 25) <= d["y"] <= (by + 25)
+                and (d["x"] <= min(rx, bx) + 25 or d["x"] >= max(rx + rw, bx + bw) - 25)
             ]
-            g_idx = pick_best_dimension(gap_candidates, left_bound - 40, (ry + rh + by) / 2, used_dims)
-            if g_idx is not None:
-                gap = dimensions[g_idx]["val"]
-                used_dims.add(g_idx)
+            val = claim_best(gap_candidates, min(rx, bx) - 30, (ry + rh + by) / 2)
+            if val is not None:
+                gap = val
 
-            # 2. Claim Adjacent PC width centered over/under the bottom zone
+            # 2. Adjacent PC Width: centered horizontally over/under bottom box
             adj_w_candidates = [
-                (i, d) for i, d in indexed_dims
-                if (bx - 20) <= d["x"] <= (bx + bw + 20)
-                and ((ry + rh - 10) <= d["y"] <= (by + 30) or (by + bh - 20) <= d["y"] <= (by + bh + 120))
+                d for d in dimensions
+                if (bx + 20) <= d["x"] <= (bx + bw - 20)
+                and (ry + rh - 10) <= d["y"] <= (by + bh + 110)
             ]
-            aw_idx = pick_best_dimension(adj_w_candidates, bx + bw / 2, by - 35, used_dims)
-            if aw_idx is not None:
-                adj_w = dimensions[aw_idx]["val"]
-                used_dims.add(aw_idx)
+            val = claim_best(adj_w_candidates, bx + bw / 2, by)
+            if val is not None:
+                adj_w = val
 
-            # 3. Claim Adjacent PC depth beside bottom box
+            # 3. Adjacent PC Depth: beside vertical midpoint of bottom box
             adj_d_candidates = [
-                (i, d) for i, d in indexed_dims
+                d for d in dimensions
                 if (by - 25) <= d["y"] <= (by + bh + 25)
                 and (d["x"] <= bx + 45 or d["x"] >= bx + bw - 45)
             ]
-            ad_idx = pick_best_dimension(adj_d_candidates, bx - 40, by + bh / 2, used_dims)
-            if ad_idx is not None:
-                adj_d = dimensions[ad_idx]["val"]
-                used_dims.add(ad_idx)
+            val = claim_best(adj_d_candidates, bx, by + bh / 2)
+            if val is not None:
+                adj_d = val
 
-            # 4. Claim Remote PC width above/below top box
+            # 4. Remote PC Width: centered above/below top box
             rem_w_candidates = [
-                (i, d) for i, d in indexed_dims
-                if (rx - 40) <= d["x"] <= (rx + rw + 40)
-                and ((ry - 130) <= d["y"] <= (ry + 25) or (ry + rh - 20) <= d["y"] <= (ry + rh + 75))
+                d for d in dimensions
+                if (rx - 25) <= d["x"] <= (rx + rw + 25)
+                and (ry - 130) <= d["y"] <= (ry + rh + 40)
             ]
-            rw_idx = pick_best_dimension(rem_w_candidates, rx + rw / 2, ry - 40, used_dims)
-            if rw_idx is not None:
-                rem_w = dimensions[rw_idx]["val"]
-                used_dims.add(rw_idx)
+            val = claim_best(rem_w_candidates, rx + rw / 2, ry)
+            if val is not None:
+                rem_w = val
 
-            # 5. Claim Remote PC depth beside top box
+            # 5. Remote PC Depth: beside vertical midpoint of top box
             rem_d_candidates = [
-                (i, d) for i, d in indexed_dims
+                d for d in dimensions
                 if (ry - 25) <= d["y"] <= (ry + rh + 25)
                 and (d["x"] <= rx + 45 or d["x"] >= rx + rw - 45)
             ]
-            rd_idx = pick_best_dimension(rem_d_candidates, rx + rw + 45, ry + rh / 2, used_dims)
-            if rd_idx is not None:
-                rem_d = dimensions[rd_idx]["val"]
-                used_dims.add(rd_idx)
+            val = claim_best(rem_d_candidates, rx + rw, ry + rh / 2)
+            if val is not None:
+                rem_d = val
 
-            if rw > rh * 1.3 and rem_w < rem_d:
-                rem_w, rem_d = rem_d, rem_w
-            elif rh > rw * 1.3 and rem_d < rem_w:
-                rem_w, rem_d = rem_d, rem_w
+            # Enforce visual aspect ratio on Adjacent PC if wider than tall
+            if bw > bh * 1.3 and adj_w < adj_d:
+                adj_w, adj_d = adj_d, adj_w
+
         else:
+            bx, by, bw, bh = boxes[0]
             adj_w_candidates = [
-                (i, d) for i, d in indexed_dims
-                if (bx - 30) <= d["x"] <= (bx + bw + 30)
-                and ((by - 130) <= d["y"] <= (by + 30) or (by + bh - 20) <= d["y"] <= (by + bh + 130))
+                d for d in dimensions
+                if (bx - 20) <= d["x"] <= (bx + bw + 20)
+                and (by - 120) <= d["y"] <= (by + bh + 120)
             ]
-            aw_idx = pick_best_dimension(adj_w_candidates, bx + bw / 2, by - 40, used_dims)
-            if aw_idx is not None:
-                adj_w = dimensions[aw_idx]["val"]
-                used_dims.add(aw_idx)
+            val = claim_best(adj_w_candidates, bx + bw / 2, by)
+            if val is not None:
+                adj_w = val
 
             adj_d_candidates = [
-                (i, d) for i, d in indexed_dims
+                d for d in dimensions
                 if (by - 25) <= d["y"] <= (by + bh + 25)
                 and (d["x"] <= bx + 45 or d["x"] >= bx + bw - 45)
             ]
-            ad_idx = pick_best_dimension(adj_d_candidates, bx - 40, by + bh / 2, used_dims)
-            if ad_idx is not None:
-                adj_d = dimensions[ad_idx]["val"]
-                used_dims.add(ad_idx)
+            val = claim_best(adj_d_candidates, bx, by + bh / 2)
+            if val is not None:
+                adj_d = val
 
-        if bw > bh * 1.3 and adj_w < adj_d:
-            adj_w, adj_d = adj_d, adj_w
-        elif bh > bw * 1.3 and adj_d < adj_w:
-            adj_w, adj_d = adj_d, adj_w
+            if bw > bh * 1.3 and adj_w < adj_d:
+                adj_w, adj_d = adj_d, adj_w
 
     with col2:
         st.subheader("Dimensioned Polygon Output")
@@ -387,12 +377,12 @@ if uploaded_file:
 
         total_w_m = max(adj_w, rem_w) if has_remote else adj_w
         total_h_m = (adj_d + gap + rem_d) if has_remote else adj_d
-        scale = min(480 / total_w_m, 480 / total_h_m)
+        scale = min(520 / total_w_m, 520 / total_h_m)
 
         out = Image.new("RGB", (800, 800), "white")
         draw = ImageDraw.Draw(out)
 
-        ax0 = 140
+        ax0 = 120
         ay1 = 680
         ay0 = ay1 - int(adj_d * scale)
         ax1 = ax0 + int(adj_w * scale)
@@ -402,10 +392,13 @@ if uploaded_file:
 
         draw.rectangle([ax0, ay0, ax1, ay1], outline="black", fill="#dbeafe", width=3)
         adj_area = round(adj_w * adj_d, 2)
-        label_y = (ay0 + ay1) // 2 - 6 if (ay1 - ay0) >= 36 else ay0 - 20
-        draw.text((ax0 + 8, label_y), f"Adjacent PC ({adj_area} sq.m)", fill="black")
+        draw.text(
+            (ax0 + 10, (ay0 + ay1) // 2 - 8),
+            f"Adjacent PC ({adj_area} sq.m)",
+            fill="black",
+        )
 
-        draw_dimension_arrow(draw, (ax0, ay1), (ax1, ay1), f"{adj_w}m", offset=38)
+        draw_dimension_arrow(draw, (ax0, ay1), (ax1, ay1), f"{adj_w}m", offset=35)
         draw_dimension_arrow(draw, (ax1, ay0), (ax1, ay1), f"{adj_d}m", offset=25)
 
         if has_remote:
@@ -413,10 +406,15 @@ if uploaded_file:
             ry0 = ry1 - int(rem_d * scale)
             rx1 = ax0 + int(rem_w * scale)
 
-            draw.rectangle([ax0, ry0, rx1, ry1], outline="black", fill="#fef3c7", width=3)
+            draw.rectangle(
+                [ax0, ry0, rx1, ry1], outline="black", fill="#fef3c7", width=3
+            )
             rem_area = round(rem_w * rem_d, 2)
-            r_label_y = (ry0 + ry1) // 2 - 6 if (ry1 - ry0) >= 36 else ry0 - 20
-            draw.text((ax0 + 8, r_label_y), f"Remote PC ({rem_area} sq.m)", fill="black")
+            draw.text(
+                (ax0 + 10, (ry0 + ry1) // 2 - 8),
+                f"Remote PC ({rem_area} sq.m)",
+                fill="black",
+            )
 
             draw_dimension_arrow(draw, (ax0, ry0), (rx1, ry0), f"{rem_w}m", offset=-25)
             draw_dimension_arrow(draw, (rx1, ry0), (rx1, ry1), f"{rem_d}m", offset=25)
@@ -430,9 +428,13 @@ if uploaded_file:
             )
 
             total_area = round(adj_area + rem_area, 2)
-            draw.text((60, 30), f"Total Pavement Cafe Area: {total_area} sq.m", fill="black")
+            draw.text(
+                (60, 30), f"Total Pavement Cafe Area: {total_area} sq.m", fill="black"
+            )
         else:
-            draw.text((60, 30), f"Total Pavement Cafe Area: {adj_area} sq.m", fill="black")
+            draw.text(
+                (60, 30), f"Total Pavement Cafe Area: {adj_area} sq.m", fill="black"
+            )
 
         st.image(out, use_container_width=True)
 
