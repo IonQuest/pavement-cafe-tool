@@ -135,8 +135,9 @@ if uploaded_file:
           if val > 100:  # Convert mm (e.g. 4500) to meters (4.5)
             val /= 1000.0
           if 0.2 <= val <= 50.0:
-            cx = int((bbox + bbox) / 2)
-            cy = int((bbox + bbox) / 2)
+           ```python
+   cx = int((bbox[0][0] + bbox[2][0]) / 2)
+   cy = int((bbox[0][1] + bbox[2][1]) / 2)
             dimensions.append({"val": round(val, 2), "x": cx, "y": cy})
 
     boxes = detect_cafe_rectangles(img_cv)
