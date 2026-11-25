@@ -50,163 +50,149 @@ def box_top_y(box):
     return by
 
 
-def normalize_lighting(gray):
-    bg = cv2.GaussianBlur(gray, (55, 55), 0)
-    norm = cv2.divide(gray, bg, scale=255)
-    return norm
-
-
 def detect_cafe_rectangles(img_cv):
-    """Detects both intact Remote PC boxes and entrance-gapped Adjacent PC boxes without merging across the walkway."""
+    """Detects both closed rectangles and open-entrance C-shaped polygons."""
     h, w = img_cv.shape[:2]
     page_area = h * w
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    norm = normalize_lighting(gray)
-    blurred = cv2.GaussianBlur(norm, (5, 5), 0)
 
+    # Normalize warm shadow gradient so pencil/ink lines have uniform contrast
+    bg = cv2.GaussianBlur(gray, (51, 51), 0)
+    norm = cv2.divide(gray, bg, scale=255)
+    blurred = cv2.GaussianBlur(norm, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
     )
 
-    # Pass 1: Light closing for intact rectangles (Remote PC)
+    raw_boxes = []
+
+    # Pass 1: Light closing for intact boxes (e.g. Remote PC)
     k_light = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed_light = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_light)
 
-    # Pass 2: Horizontal-only wide closing to bridge customer entrance openings without merging vertical zones
-    k_horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (45, 3))
+    # Pass 2: Wide horizontal closing (18% of image width) to bridge wide customer access openings
+    bridge_w = max(65, int(w * 0.18))
+    k_horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_w, 5))
     closed_horiz = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_horiz)
-    closed_horiz = cv2.morphologyEx(closed_horiz, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 9)))
+    closed_horiz = cv2.morphologyEx(closed_horiz, cv2.MORPH_CLOSE, k_light)
 
-    raw_boxes = []
-    for mask in (closed_light, closed_horiz):
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    for binary in (closed_light, closed_horiz):
+        contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
             area = cv2.contourArea(c)
-            if area < (page_area * 0.0012) or area > (page_area * 0.45):
+            if area < (page_area * 0.004) or area > (page_area * 0.45):
                 continue
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-            bx, by, bw, bh = cv2.boundingRect(approx)
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # Filter out tiny noise boxes (like the 25x25px arrow intersection artifact)
+            if bw < int(w * 0.08) or bh < int(h * 0.04):
+                continue
             rect_fill = area / float(bw * bh) if (bw * bh) > 0 else 0
-            if 4 <= len(approx) <= 8 and bw > 30 and bh > 22 and rect_fill > 0.65:
+            if rect_fill > 0.65:
                 raw_boxes.append((bx, by, bw, bh))
 
-    # Deduplicate overlapping boxes (keep largest clean outline per zone)
+    # Deduplicate overlapping boxes (keep largest cleanly closed version)
     raw_boxes.sort(key=box_area, reverse=True)
     unique_boxes = []
     for bx, by, bw, bh in raw_boxes:
         is_dup = False
         for ux, uy, uw, uh in unique_boxes:
-            inter_x1 = max(bx, ux)
-            inter_y1 = max(by, uy)
-            inter_x2 = min(bx + bw, ux + uw)
-            inter_y2 = min(by + bh, uy + uh)
-            if inter_x2 > inter_x1 and inter_y2 > inter_y1:
-                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-                if inter_area > 0.5 * min(bw * bh, uw * uh):
+            # Check IoU / overlap
+            ix1 = max(bx, ux)
+            iy1 = max(by, uy)
+            ix2 = min(bx + bw, ux + uw)
+            iy2 = min(by + bh, uy + uh)
+            if ix2 > ix1 and iy2 > iy1:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                if inter / float(min(bw * bh, uw * uh)) > 0.45:
                     is_dup = True
                     break
         if not is_dup:
             unique_boxes.append((bx, by, bw, bh))
 
-    # Remove any outer container box that wraps around inner boxes
+    # Remove any outer container box that wraps around other detected boxes
     inner_boxes = []
     for i, (bx, by, bw, bh) in enumerate(unique_boxes):
-        contains_others = False
+        contains_others = 0
         for j, (ox, oy, ow, oh) in enumerate(unique_boxes):
             if i != j and bx <= ox + 10 and by <= oy + 10 and (bx + bw) >= (ox + ow - 10) and (by + bh) >= (oy + oh - 10):
-                contains_others = True
-                break
-        if not contains_others:
+                contains_others += 1
+        if contains_others == 0:
             inner_boxes.append((bx, by, bw, bh))
 
     inner_boxes.sort(key=box_top_y)
     return inner_boxes
 
 
-def parse_ocr_items(ocr_results, dimensions_list):
-    if not ocr_results:
-        return
-    for item in ocr_results:
-        bbox, text, _ = item
-        pts = np.array(bbox, dtype=float)
-        xs = pts[:, 0]
-        ys = pts[:, 1]
-        box_w = max(xs) - min(xs)
-        box_h = max(ys) - min(ys)
-
-        # Reject tall, skinny vertical arrow lines misread as "1" or "1.6"
-        if box_h > 0 and (box_h / max(box_w, 1.0)) > 2.4:
-            continue
-
-        raw_str = str(text).strip()
-        has_unit = bool(re.search(r"[mM]", raw_str))
-        clean_text = (
-            raw_str.replace(",", ".")
-            .replace("O", "0")
-            .replace("o", "0")
-            .replace("S", "5")
-            .replace("s", "5")
-        )
-        for match in re.finditer(r"(\d+\.?\d*)", clean_text):
-            val = float(match.group(1))
-            if val > 100:
-                val /= 1000.0
-            # Block bare "1" or "1.0" without an "m" unit (vertical line artifact)
-            if abs(val - 1.0) < 0.05 and not has_unit:
-                continue
-            if 0.4 <= val <= 50.0:
-                # Snap noisy decimals when no decimal point was written
-                if "." not in match.group(1):
-                    val = round(val)
-                center_x = int(xs.mean())
-                center_y = int(ys.mean())
-                # Avoid duplicate detections at the exact same spot from dual passes
-                already = any(
-                    abs(d["x"] - center_x) < 25 and abs(d["y"] - center_y) < 25 and abs(d["val"] - val) < 0.1
-                    for d in dimensions_list
-                )
-                if not already:
-                    dimensions_list.append({
-                        "val": round(val, 2),
-                        "x": center_x,
-                        "y": center_y,
-                        "has_unit": has_unit,
-                        "used": False,
-                    })
-
-
 def extract_dimensions(pil_img):
-    dimensions = []
-    # Pass 1: Contrast-boosted original image
-    enhanced = ImageEnhance.Contrast(pil_img).enhance(2.0)
-    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.8)
-    res1, _ = ocr(np.array(enhanced))
-    parse_ocr_items(res1, dimensions)
+    """Dual-pass OCR with handwritten character cleanup."""
+    enhanced = ImageEnhance.Contrast(pil_img).enhance(1.9)
+    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.6)
+    img_np = np.array(enhanced)
 
-    # Pass 2: Lighting-normalized grayscale image
     gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
-    norm = normalize_lighting(gray)
-    res2, _ = ocr(cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB))
-    parse_ocr_items(res2, dimensions)
+    bg = cv2.GaussianBlur(gray, (51, 51), 0)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm_rgb = cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB)
 
+    dimensions = []
+    for source_np in (img_np, norm_rgb):
+        ocr_results, _ = ocr(source_np)
+        if not ocr_results:
+            continue
+        for item in ocr_results:
+            bbox, text, _ = item
+            raw_str = str(text).strip()
+            has_unit = ("m" in raw_str.lower())
+            clean_text = (
+                raw_str.replace(",", ".")
+                .replace("O", "0")
+                .replace("o", "0")
+                .replace("S", "5")
+                .replace("s", "5")
+            )
+            for match in re.finditer(r"(\d+\.?\d*)", clean_text):
+                val = float(match.group(1))
+                if val > 100:
+                    val /= 1000.0
+                if val == 1.0 and not has_unit:
+                    continue
+                if 0.2 <= val <= 50.0:
+                    pts = np.array(bbox, dtype=float)
+                    bw_txt = pts[:, 0].max() - pts[:, 0].min()
+                    bh_txt = pts[:, 1].max() - pts[:, 1].min()
+                    # Reject tall thin vertical arrow lines misread as digits
+                    if bh_txt > bw_txt * 2.4:
+                        continue
+                    center_x, center_y = pts.mean(axis=0)
+                    # Deduplicate across both passes
+                    already = False
+                    for existing in dimensions:
+                        if abs(existing["x"] - center_x) < 25 and abs(existing["y"] - center_y) < 25:
+                            if has_unit and not existing["has_unit"]:
+                                existing["val"] = round(val, 2)
+                                existing["has_unit"] = True
+                            already = True
+                            break
+                    if not already:
+                        dimensions.append({
+                            "val": round(val, 2),
+                            "x": int(center_x),
+                            "y": int(center_y),
+                            "has_unit": has_unit,
+                        })
     return dimensions
 
 
-def claim_best(candidates, target_x, target_y, max_dist=320):
-    unused = [d for d in candidates if not d["used"]]
-    if not unused:
+def claim_best(candidates, target_x, target_y, used_ids):
+    avail = [d for d in candidates if id(d) not in used_ids]
+    if not avail:
         return None
     best = min(
-        unused,
-        key=lambda d: ((d["x"] - target_x) ** 2 + (d["y"] - target_y) ** 2) ** 0.5
-        - (50 if d["has_unit"] else 0),
+        avail,
+        key=lambda d: ((d["x"] - target_x) ** 2 + (d["y"] - target_y) ** 2) - (3600 if d["has_unit"] else 0),
     )
-    dist = ((best["x"] - target_x) ** 2 + (best["y"] - target_y) ** 2) ** 0.5
-    if dist <= max_dist:
-        best["used"] = True
-        return best["val"]
-    return None
+    used_ids.add(id(best))
+    return best["val"]
 
 
 uploaded_file = st.file_uploader(
@@ -235,7 +221,7 @@ if uploaded_file:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Uploaded Plan & Detection Preview")
+        st.subheader("Uploaded Plan & What the App Detected")
         debug_img = pil_img.copy()
         debug_draw = ImageDraw.Draw(debug_img)
         for idx, (bx, by, bw, bh) in enumerate(boxes):
@@ -248,90 +234,78 @@ if uploaded_file:
         st.image(debug_img, use_container_width=True)
         st.caption("Green boxes = detected PC zones | Red dots = numbers read by OCR")
 
-    adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 2.0, 2.0, 2.0
+    adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 4.0, 1.5, 2.0
+    used_ids = set()
 
     if boxes and dimensions:
         bx, by, bw, bh = boxes[-1]  # Bottom box = Adjacent PC
 
         if len(boxes) >= 2:
             has_remote = True
-            rx, ry, rw, rh = boxes[0]  # Top box = Remote PC
+            rx, ry, rw, rh = next(iter(boxes))  # Top box = Remote PC
 
-            # 1. Claim Clear Gap strictly along the left or right outer margin between the two boxes
-            margin_limit_left = max(bx, rx) + 45
-            margin_limit_right = min(bx + bw, rx + rw) - 45
-            gap_cands = [
+            # 1. Claim Clear Gap along left/right margin between Remote and Adjacent boxes
+            gap_y = (ry + rh + by) / 2.0
+            margin_limit = min(bx, rx) + 55
+            right_limit = max(bx + bw, rx + rw) - 55
+            gap_candidates = [
                 d for d in dimensions
-                if (ry + rh - 10) <= d["y"] <= (by + 10)
-                and (d["x"] <= margin_limit_left or d["x"] >= margin_limit_right)
+                if (ry + rh - 25) <= d["y"] <= (by + 25)
+                and (d["x"] <= margin_limit or d["x"] >= right_limit)
             ]
-            val_gap = claim_best(gap_cands, min(bx, rx), (ry + rh + by) / 2, max_dist=350)
-            if val_gap is not None:
-                gap = val_gap
+            g_val = claim_best(gap_candidates, min(bx, rx), gap_y, used_ids)
+            if g_val is not None:
+                gap = g_val
 
-            # 2. Claim Adjacent PC Width from the centered walkway label between the boxes (or below bottom box)
-            adj_w_cands = [
+            # 2. Claim Adjacent PC width centered over/under the wide bottom box
+            adj_w_candidates = [
                 d for d in dimensions
-                if (ry + rh - 10) <= d["y"] <= (by + bh + 160)
-                and (bx - 40) <= d["x"] <= (bx + bw + 40)
+                if (ry + rh - 10) <= d["y"] <= (by + bh + 90)
+                and (bx + 40) <= d["x"] <= (bx + bw - 40)
             ]
-            val_adj_w = claim_best(adj_w_cands, bx + bw / 2, by, max_dist=380)
-            if val_adj_w is not None:
-                adj_w = val_adj_w
+            aw_val = claim_best(adj_w_candidates, bx + bw / 2.0, by, used_ids)
+            if aw_val is not None:
+                adj_w = aw_val
 
-            # 3. Claim Adjacent PC Depth beside the bottom box
-            adj_d_cands = [
+            # 3. Claim Adjacent PC depth beside its left or right edge
+            adj_d_candidates = [
                 d for d in dimensions
-                if (by - 40) <= d["y"] <= (by + bh + 40)
-                and (d["x"] <= bx + 45 or d["x"] >= bx + bw - 45)
+                if (by - 25) <= d["y"] <= (by + bh + 25)
+                and (d["x"] <= bx + 35 or d["x"] >= bx + bw - 35)
             ]
-            val_adj_d = claim_best(adj_d_cands, bx, by + bh / 2, max_dist=320)
-            if val_adj_d is not None:
-                adj_d = val_adj_d
+            ad_val = claim_best(adj_d_candidates, bx, by + bh / 2.0, used_ids)
+            if ad_val is not None:
+                adj_d = ad_val
 
-            # 4. Claim Remote PC Width above/below top box
-            rem_w_cands = [
+            # 4. Claim Remote PC width & depth
+            rem_w_candidates = [
                 d for d in dimensions
-                if (ry - 160) <= d["y"] <= (ry + rh + 40)
-                and (rx - 40) <= d["x"] <= (rx + rw + 40)
+                if d["y"] <= ry + 35 and (rx - 30) <= d["x"] <= (rx + rw + 30)
             ]
-            val_rem_w = claim_best(rem_w_cands, rx + rw / 2, ry, max_dist=320)
-            if val_rem_w is not None:
-                rem_w = val_rem_w
+            rw_val = claim_best(rem_w_candidates, rx + rw / 2.0, ry, used_ids)
+            if rw_val is not None:
+                rem_w = rw_val
 
-            # 5. Claim Remote PC Depth beside top box
-            rem_d_cands = [
+            rem_d_candidates = [
                 d for d in dimensions
-                if (ry - 40) <= d["y"] <= (ry + rh + 40)
-                and (d["x"] <= rx + 45 or d["x"] >= rx + rw - 45)
+                if (ry - 25) <= d["y"] <= (ry + rh + 25)
+                and (d["x"] <= rx + 35 or d["x"] >= rx + rw - 35)
             ]
-            val_rem_d = claim_best(rem_d_cands, rx + rw, ry + rh / 2, max_dist=320)
-            if val_rem_d is not None:
-                rem_d = val_rem_d
-
-            # Orientation safeguard: if Remote box is clearly wider than tall, ensure width >= depth
-            if rw > rh * 1.35 and rem_d > rem_w:
-                rem_w, rem_d = rem_d, rem_w
+            rd_val = claim_best(rem_d_candidates, rx + rw, ry + rh / 2.0, used_ids)
+            if rd_val is not None:
+                rem_d = rd_val
         else:
-            # Single Adjacent PC layout
-            adj_w_cands = [
-                d for d in dimensions
-                if (bx - 40) <= d["x"] <= (bx + bw + 40)
-            ]
-            val_adj_w = claim_best(adj_w_cands, bx + bw / 2, by, max_dist=380)
-            if val_adj_w is not None:
-                adj_w = val_adj_w
+            aw_val = claim_best(dimensions, bx + bw / 2.0, by, used_ids)
+            if aw_val is not None:
+                adj_w = aw_val
+            ad_val = claim_best(dimensions, bx, by + bh / 2.0, used_ids)
+            if ad_val is not None:
+                adj_d = ad_val
 
-            adj_d_cands = [
-                d for d in dimensions
-                if (by - 40) <= d["y"] <= (by + bh + 40)
-            ]
-            val_adj_d = claim_best(adj_d_cands, bx, by + bh / 2, max_dist=320)
-            if val_adj_d is not None:
-                adj_d = val_adj_d
-
-        # Orientation safeguard: if Adjacent box is clearly wider than tall, ensure width >= depth
-        if bw > bh * 1.35 and adj_d > adj_w:
+        # Enforce visual aspect-ratio orientation so wide boxes never flip vertically
+        if bw > bh * 1.3 and adj_d > adj_w:
+            adj_w, adj_d = adj_d, adj_w
+        elif bh > bw * 1.3 and adj_w > adj_d:
             adj_w, adj_d = adj_d, adj_w
 
     with col2:
@@ -380,11 +354,11 @@ if uploaded_file:
 
         draw.rectangle([ax0, ay0, ax1, ay1], outline="black", fill="#dbeafe", width=3)
         adj_area = round(adj_w * adj_d, 2)
-        adj_label = f"Adjacent PC ({adj_area} sq.m)"
-        if (ax1 - ax0) >= 150:
-            draw.text((ax0 + 10, (ay0 + ay1) // 2 - 8), adj_label, fill="black")
-        else:
-            draw.text((ax0, ay0 - 18), adj_label, fill="black")
+        draw.text(
+            (ax0 + 10, (ay0 + ay1) // 2 - 8),
+            f"Adjacent PC ({adj_area} sq.m)",
+            fill="black",
+        )
 
         draw_dimension_arrow(draw, (ax0, ay1), (ax1, ay1), f"{adj_w}m", offset=35)
         draw_dimension_arrow(draw, (ax1, ay0), (ax1, ay1), f"{adj_d}m", offset=25)
@@ -394,25 +368,35 @@ if uploaded_file:
             ry0 = ry1 - int(rem_d * scale)
             rx1 = ax0 + int(rem_w * scale)
 
-            draw.rectangle([ax0, ry0, rx1, ry1], outline="black", fill="#fef3c7", width=3)
+            draw.rectangle(
+                [ax0, ry0, rx1, ry1], outline="black", fill="#fef3c7", width=3
+            )
             rem_area = round(rem_w * rem_d, 2)
-            rem_label = f"Remote PC ({rem_area} sq.m)"
-            if (rx1 - ax0) >= 150:
-                draw.text((ax0 + 10, (ry0 + ry1) // 2 - 8), rem_label, fill="black")
-            else:
-                draw.text((ax0, ry1 + 6), rem_label, fill="black")
+            draw.text(
+                (ax0 + 10, (ry0 + ry1) // 2 - 8),
+                f"Remote PC ({rem_area} sq.m)",
+                fill="black",
+            )
 
             draw_dimension_arrow(draw, (ax0, ry0), (rx1, ry0), f"{rem_w}m", offset=-25)
             draw_dimension_arrow(draw, (rx1, ry0), (rx1, ry1), f"{rem_d}m", offset=25)
 
             gap_x = ax0 + int(min(adj_w, rem_w) * scale * 0.5)
             draw.line([(gap_x, ry1), (gap_x, ay0)], fill="#dc2626", width=2)
-            draw.text((gap_x + 8, (ry1 + ay0) // 2 - 6), f"Clear Gap: {gap}m", fill="#dc2626")
+            draw.text(
+                (gap_x + 8, (ry1 + ay0) // 2 - 6),
+                f"Clear Gap: {gap}m",
+                fill="#dc2626",
+            )
 
             total_area = round(adj_area + rem_area, 2)
-            draw.text((60, 30), f"Total Pavement Cafe Area: {total_area} sq.m", fill="black")
+            draw.text(
+                (60, 30), f"Total Pavement Cafe Area: {total_area} sq.m", fill="black"
+            )
         else:
-            draw.text((60, 30), f"Total Pavement Cafe Area: {adj_area} sq.m", fill="black")
+            draw.text(
+                (60, 30), f"Total Pavement Cafe Area: {adj_area} sq.m", fill="black"
+            )
 
         st.image(out, use_container_width=True)
 
