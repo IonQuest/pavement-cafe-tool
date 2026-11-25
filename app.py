@@ -1,8 +1,9 @@
 import io
 import re
-import fitz  # PyMuPDF for PDF uploads
+import cv2
+import fitz
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance
 from rapidocr_onnxruntime import RapidOCR
 import streamlit as st
 
@@ -19,10 +20,9 @@ ocr = load_ocr()
 
 
 def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
-  """Draws a clean architectural dimension line with extension ticks and label."""
   x1, y1 = p1
   x2, y2 = p2
-  if y1 == y2:  # Horizontal dimension
+  if y1 == y2:
     yd = y1 + offset
     draw.line([(x1, y1), (x1, yd)], fill="#64748b", width=1)
     draw.line([(x2, y2), (x2, yd)], fill="#64748b", width=1)
@@ -30,7 +30,7 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
     draw.line([(x1 - 4, yd + 4), (x1 + 4, yd - 4)], fill=color, width=2)
     draw.line([(x2 - 4, yd + 4), (x2 + 4, yd - 4)], fill=color, width=2)
     draw.text(((x1 + x2) // 2 - 18, yd + 5), text, fill=color)
-  else:  # Vertical dimension
+  else:
     xd = x1 + offset
     draw.line([(x1, y1), (xd, y1)], fill="#64748b", width=1)
     draw.line([(x2, y2), (xd, y2)], fill="#64748b", width=1)
@@ -40,53 +40,53 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
     draw.text((xd + 8, (y1 + y2) // 2 - 6), text, fill=color)
 
 
-def find_boxes_no_cv2(pil_img):
-  """Finds main rectangular boundary boxes using pure NumPy without OpenCV."""
-  gray = np.array(pil_img.convert("L"))
-  dark = gray < 180
-  h, w = dark.shape
-  visited = np.zeros_like(dark, dtype=bool)
-  boxes = []
+def detect_cafe_rectangles(img_cv):
+  """Finds distinct rectangular zones (ignoring outer page borders and tiny clutter)."""
+  h, w = img_cv.shape[:2]
+  page_area = h * w
+  gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+  blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+  # Adaptive threshold catches both dark ink and lighter pencil/scan lines
+  thresh = cv2.adaptiveThreshold(
+      blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
+  )
+  # Close small gaps in hand-drawn rectangle corners
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+  closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-  # Downsample by 4x for fast pure-Python connected-component scan
-  step = 4
-  small = dark[::step, ::step]
-  sh, sw = small.shape
-  vis = np.zeros_like(small, dtype=bool)
+  contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+  raw_boxes = []
+  for c in contours:
+    area = cv2.contourArea(c)
+    if area < (page_area * 0.005) or area > (page_area * 0.75):
+      continue
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+    bx, by, bw, bh = cv2.boundingRect(approx)
+    # Keep roughly rectangular shapes (4 to 6 vertices) of reasonable size
+    if 4 <= len(approx) <= 6 and bw > 50 and bh > 30:
+      raw_boxes.append((bx, by, bw, bh))
 
-  for y in range(sh):
-    for x in range(sw):
-      if small[y, x] and not vis[y, x]:
-        stack = [(y, x)]
-        vis[y, x] = True
-        min_x = max_x = x
-        min_y = max_y = y
-        while stack:
-          cy, cx = stack.pop()
-          if cx < min_x:
-            min_x = cx
-          if cx > max_x:
-            max_x = cx
-          if cy < min_y:
-            min_y = cy
-          if cy > max_y:
-            max_y = cy
-          for ny, nx in (
-              (cy - 1, cx),
-              (cy + 1, cx),
-              (cy, cx - 1),
-              (cy, cx + 1),
-          ):
-            if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not vis[ny, nx]:
-              vis[ny, nx] = True
-              stack.append((ny, nx))
-        bw = (max_x - min_x) * step
-        bh = (max_y - min_y) * step
-        if bw > 80 and bh > 40 and bw < w * 0.95:
-          boxes.append((min_x * step, min_y * step, bw, bh))
+  # Remove duplicate overlapping boxes (inner/outer wall of same rectangle)
+  raw_boxes.sort(key=lambda b: b * b, reverse=True)
+  unique_boxes = []
+  for bx, by, bw, bh in raw_boxes:
+    is_dup = False
+    for ux, uy, uw, uh in unique_boxes:
+      if (
+          abs(bx - ux) < 25
+          and abs(by - uy) < 25
+          and abs(bw - uw) < 40
+          and abs(bh - uh) < 40
+      ):
+        is_dup = True
+        break
+    if not is_dup:
+      unique_boxes.append((bx, by, bw, bh))
 
-  boxes.sort(key=lambda b: b[1])  # Sort top-to-bottom
-  return boxes
+  # Sort top-to-bottom by Y coordinate
+  unique_boxes.sort(key=lambda b: b)
+  return unique_boxes
 
 
 uploaded_file = st.file_uploader(
@@ -97,49 +97,55 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
   file_bytes = uploaded_file.read()
 
-  # Convert PDF page 1 or standard image into Pillow RGB format
   if uploaded_file.name.lower().endswith(".pdf"):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pix = doc.load_page(0).get_pixmap(dpi=150)
+    pix = doc.load_page(0).get_pixmap(dpi=200)
     pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
   else:
     pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-  # Resize large images so free hosting never runs out of memory
+  # Resize to ~1400px wide for sharp handwriting detail without hitting RAM limits
   w, h = pil_img.size
-  if w > 1200:
-    pil_img = pil_img.resize((1200, int(h * (1200 / w))))
+  if w > 1400:
+    pil_img = pil_img.resize((1400, int(h * (1400 / w))))
 
   col1, col2 = st.columns(2)
   with col1:
     st.subheader("Uploaded Plan")
     st.image(pil_img, use_container_width=True)
 
-  # --- AUTOMATIC EXTRACTION (RapidOCR + Pure NumPy) ---
   with st.spinner("Reading dimensions and detecting boundary polygons..."):
-    img_np = np.array(pil_img)
+    # Boost contrast & sharpness to help OCR read handwritten numbers
+    enhanced = ImageEnhance.Contrast(pil_img).enhance(1.8)
+    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.5)
+    img_np = np.array(enhanced)
+    img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
     ocr_results, _ = ocr(img_np)
     dimensions = []
     if ocr_results:
       for item in ocr_results:
         bbox, text, _ = item
-        match = re.search(r"(\d+\.?\d*)", str(text))
-        if match:
+        # Clean common handwriting OCR confusions (e.g. 'O' -> '0', ',' -> '.')
+        clean_text = (
+            str(text).replace(",", ".").replace("O", "0").replace("o", "0")
+        )
+        for match in re.finditer(r"(\d+\.?\d*)", clean_text):
           val = float(match.group(1))
           if val > 100:  # Convert mm (e.g. 4500) to meters (4.5)
             val /= 1000.0
           if 0.2 <= val <= 50.0:
-            cx = int((bbox[0][0] + bbox[2][0]) / 2)
-            cy = int((bbox[0][1] + bbox[2][1]) / 2)
-            dimensions.append({"val": val, "x": cx, "y": cy})
+            cx = int((bbox + bbox) / 2)
+            cy = int((bbox + bbox) / 2)
+            dimensions.append({"val": round(val, 2), "x": cx, "y": cy})
 
-    boxes = find_boxes_no_cv2(pil_img)
+    boxes = detect_cafe_rectangles(img_cv)
 
   # Default fallback values
   adj_w, adj_d, has_remote, rem_w, rem_d, gap = 4.0, 1.5, False, 4.0, 1.5, 2.0
 
   if boxes and dimensions:
-    bx, by, bw, bh = boxes[-1]  # Bottom box assumed to be Adjacent PC
+    bx, by, bw, bh = boxes[-1]  # Bottom box = Adjacent PC
     adj_w = min(
         dimensions,
         key=lambda d: (d["x"] - (bx + bw / 2)) ** 2 + (d["y"] - by) ** 2,
@@ -149,9 +155,9 @@ if uploaded_file:
         key=lambda d: (d["x"] - bx) ** 2 + (d["y"] - (by + bh / 2)) ** 2,
     )["val"]
 
-    if len(boxes) > 1:
+    if len(boxes) >= 2:
       has_remote = True
-      rx, ry, rw, rh = boxes[0]  # Top box assumed to be Remote PC
+      rx, ry, rw, rh = boxes  # Top box = Remote PC
       rem_w = min(
           dimensions,
           key=lambda d: (d["x"] - (rx + rw / 2)) ** 2 + (d["y"] - ry) ** 2,
@@ -166,9 +172,14 @@ if uploaded_file:
           key=lambda d: (d["x"] - (rx + rw / 2)) ** 2 + (d["y"] - gap_y) ** 2,
       )["val"]
 
-  # --- AUTO-FILLED CONTROLS & RENDERER ---
   with col2:
     st.subheader("Dimensioned Polygon Output")
+    detected_vals = [f"{d['val']}m" for d in dimensions]
+    st.caption(
+        f"Detected {len(boxes)} zone(s) | Numbers read on plan:"
+        f" {', '.join(detected_vals) if detected_vals else 'None'}"
+    )
+
     c1, c2 = st.columns(2)
     adj_w = c1.number_input(
         "Adjacent PC Width (m)", value=float(adj_w), min_value=0.1, step=0.1
@@ -190,7 +201,6 @@ if uploaded_file:
           "Separation Gap (m)", value=float(gap), min_value=0.1, step=0.1
       )
 
-    # Auto-calculate scale so the drawing fits neatly on an 800x800 canvas
     total_w_m = max(adj_w, rem_w) if has_remote else adj_w
     total_h_m = (adj_d + gap + rem_d) if has_remote else adj_d
     scale = min(520 / total_w_m, 520 / total_h_m)
@@ -198,7 +208,6 @@ if uploaded_file:
     out = Image.new("RGB", (800, 800), "white")
     draw = ImageDraw.Draw(out)
 
-    # Premises / Building Frontage reference line along the bottom
     ax0 = 120
     ay1 = 680
     ay0 = ay1 - int(adj_d * scale)
@@ -207,7 +216,6 @@ if uploaded_file:
     draw.line([(60, ay1), (740, ay1)], fill="black", width=4)
     draw.text((65, ay1 + 12), "PREMISES / BUILDING FRONTAGE", fill="black")
 
-    # Draw Adjacent PC Polygon
     draw.rectangle([ax0, ay0, ax1, ay1], outline="black", fill="#dbeafe", width=3)
     adj_area = round(adj_w * adj_d, 2)
     draw.text(
@@ -216,11 +224,9 @@ if uploaded_file:
         fill="black",
     )
 
-    # External dimension lines for Adjacent PC
     draw_dimension_arrow(draw, (ax0, ay1), (ax1, ay1), f"{adj_w}m", offset=35)
     draw_dimension_arrow(draw, (ax1, ay0), (ax1, ay1), f"{adj_d}m", offset=25)
 
-    # Draw Remote PC Polygon & Gap
     if has_remote:
       ry1 = ay0 - int(gap * scale)
       ry0 = ry1 - int(rem_d * scale)
@@ -236,11 +242,9 @@ if uploaded_file:
           fill="black",
       )
 
-      # External dimension lines for Remote PC
       draw_dimension_arrow(draw, (ax0, ry0), (rx1, ry0), f"{rem_w}m", offset=-25)
       draw_dimension_arrow(draw, (rx1, ry0), (rx1, ry1), f"{rem_d}m", offset=25)
 
-      # Separation gap arrow between Adjacent and Remote zones
       gap_x = ax0 + int(min(adj_w, rem_w) * scale * 0.5)
       draw.line([(gap_x, ry1), (gap_x, ay0)], fill="#dc2626", width=2)
       draw.text(
@@ -260,7 +264,6 @@ if uploaded_file:
 
     st.image(out, use_container_width=True)
 
-    # Export to JPEG
     buf = io.BytesIO()
     out.save(buf, format="JPEG", quality=95)
     st.download_button(
