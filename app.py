@@ -3,7 +3,7 @@ import re
 import cv2
 import fitz
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance
+from PIL import Image, ImageDraw
 from rapidocr_onnxruntime import RapidOCR
 import streamlit as st
 
@@ -20,6 +20,7 @@ ocr = load_ocr()
 
 
 def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
+    """Draws a clean architectural dimension line with extension ticks and label."""
     x1, y1 = p1
     x2, y2 = p2
     if y1 == y2:
@@ -29,7 +30,7 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
         draw.line([(x1, yd), (x2, yd)], fill=color, width=2)
         draw.line([(x1 - 4, yd + 4), (x1 + 4, yd - 4)], fill=color, width=2)
         draw.line([(x2 - 4, yd + 4), (x2 + 4, yd - 4)], fill=color, width=2)
-        draw.text(((x1 + x2) // 2 - 18, yd + 5), text, fill=color)
+        draw.text(((x1 + x2) // 2 - 18, yd + 5 if offset > 0 else yd - 18), text, fill=color)
     else:
         xd = x1 + offset
         draw.line([(x1, y1), (xd, y1)], fill="#64748b", width=1)
@@ -40,132 +41,32 @@ def draw_dimension_arrow(draw, p1, p2, text, offset=25, color="black"):
         draw.text((xd + 8, (y1 + y2) // 2 - 6), text, fill=color)
 
 
-def draw_zone_with_entrance(draw, rect, fill_color, entrance_side="None", gap_ratio=0.32):
-    x0, y0, x1, y1 = rect
-    draw.rectangle([x0, y0, x1, y1], fill=fill_color, outline=None)
-
-    w = x1 - x0
-    h = y1 - y0
-    tick = 10
-
-    if entrance_side == "top":
-        gx0 = x0 + int(w * (0.5 - gap_ratio / 2))
-        gx1 = x0 + int(w * (0.5 + gap_ratio / 2))
-        draw.line([(x0, y0), (gx0, y0)], fill="black", width=3)
-        draw.line([(gx1, y0), (x1, y0)], fill="black", width=3)
-        draw.line([(gx0, y0), (gx0, y0 + tick)], fill="black", width=2)
-        draw.line([(gx1, y0), (gx1, y0 + tick)], fill="black", width=2)
-        draw.text(((gx0 + gx1) // 2 - 26, y0 + 4), "ENTRANCE", fill="#0f172a")
-    else:
-        draw.line([(x0, y0), (x1, y0)], fill="black", width=3)
-
-    if entrance_side == "bottom":
-        gx0 = x0 + int(w * (0.5 - gap_ratio / 2))
-        gx1 = x0 + int(w * (0.5 + gap_ratio / 2))
-        draw.line([(x0, y1), (gx0, y1)], fill="black", width=3)
-        draw.line([(gx1, y1), (x1, y1)], fill="black", width=3)
-        draw.line([(gx0, y1), (gx0, y1 - tick)], fill="black", width=2)
-        draw.line([(gx1, y1), (gx1, y1 - tick)], fill="black", width=2)
-        draw.text(((gx0 + gx1) // 2 - 26, y1 - 16), "ENTRANCE", fill="#0f172a")
-    else:
-        draw.line([(x0, y1), (x1, y1)], fill="black", width=3)
-
-    if entrance_side == "left":
-        gy0 = y0 + int(h * (0.5 - gap_ratio / 2))
-        gy1 = y0 + int(h * (0.5 + gap_ratio / 2))
-        draw.line([(x0, y0), (x0, gy0)], fill="black", width=3)
-        draw.line([(x0, gy1), (x0, y1)], fill="black", width=3)
-        draw.line([(x0, gy0), (x0 + tick, gy0)], fill="black", width=2)
-        draw.line([(x0, gy1), (x0 + tick, gy1)], fill="black", width=2)
-        draw.text((x0 + 6, (gy0 + gy1) // 2 - 6), "ENTRANCE", fill="#0f172a")
-    else:
-        draw.line([(x0, y0), (x0, y1)], fill="black", width=3)
-
-    if entrance_side == "right":
-        gy0 = y0 + int(h * (0.5 - gap_ratio / 2))
-        gy1 = y0 + int(h * (0.5 + gap_ratio / 2))
-        draw.line([(x1, y0), (x1, gy0)], fill="black", width=3)
-        draw.line([(x1, gy1), (x1, y1)], fill="black", width=3)
-        draw.line([(x1, gy0), (x1 - tick, gy0)], fill="black", width=2)
-        draw.line([(x1, gy1), (x1 - tick, gy1)], fill="black", width=2)
-        draw.text((x1 - 58, (gy0 + gy1) // 2 - 6), "ENTRANCE", fill="#0f172a")
-    else:
-        draw.line([(x1, y0), (x1, y1)], fill="black", width=3)
-
-
-def box_area(box):
-    bx, by, bw, bh = box
-    return bw * bh
-
-
-def box_top_y(box):
-    bx, by, bw, bh = box
-    return by
-
-
-def detect_entrance_opening(thresh, box):
-    bx, by, bw, bh = box
-    h, w = thresh.shape
-    band = max(8, int(min(bw, bh) * 0.14))
-
-    edges = {
-        "top": thresh[max(0, by - band):min(h, by + band), bx + int(bw * 0.15):bx + int(bw * 0.85)],
-        "bottom": thresh[max(0, by + bh - band):min(h, by + bh + band), bx + int(bw * 0.15):bx + int(bw * 0.85)],
-        "left": thresh[by + int(bh * 0.15):by + int(bh * 0.85), max(0, bx - band):min(w, bx + band)],
-        "right": thresh[by + int(bh * 0.15):by + int(bh * 0.85), max(0, bx + bw - band):min(w, bx + bw + band)],
-    }
-
-    best_side = "None"
-    best_gap_ratio = 0.0
-
-    for side, strip in edges.items():
-        if strip.size == 0:
-            continue
-        axis = 0 if side in ("top", "bottom") else 1
-        profile = (strip > 0).any(axis=axis).astype(np.uint8)
-        if profile.size < 10:
-            continue
-
-        max_run = 0
-        cur_run = 0
-        for val in profile:
-            if val == 0:
-                cur_run += 1
-                if cur_run > max_run:
-                    max_run = cur_run
-            else:
-                cur_run = 0
-
-        gap_ratio = max_run / float(profile.size)
-        if 0.15 <= gap_ratio <= 0.65 and gap_ratio > best_gap_ratio:
-            best_gap_ratio = gap_ratio
-            best_side = side
-
-    return best_side
-
-
-def detect_cafe_rectangles(img_cv):
-    h, w = img_cv.shape[:2]
-    page_area = h * w
+def normalize_lighting(img_cv):
+    """Removes warm paper shadows/gradients so dark pen/pencil lines stand out cleanly."""
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    bg = cv2.GaussianBlur(gray, (51, 51), 0)
+    norm = cv2.divide(gray, bg, scale=255)
+    return norm
 
-    bg = cv2.medianBlur(gray, 51)
-    norm = 255 - cv2.absdiff(gray, bg)
-    blurred = cv2.GaussianBlur(norm, (5, 5), 0)
 
+def detect_cafe_rectangles(norm_gray):
+    """Finds closed and open-access (C-shaped) pavement cafe zones, including smaller Remote PCs."""
+    h, w = norm_gray.shape[:2]
+    page_area = h * w
+
+    blurred = cv2.GaussianBlur(norm_gray, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 12
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 12
     )
 
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, w // 14), 3))
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, max(25, h // 14)))
-    bridged = cv2.bitwise_or(
-        cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, horiz_kernel),
-        cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, vert_kernel),
-    )
-    bridged = cv2.morphologyEx(bridged, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    # Bridge access openings in perimeter lines so open-access boxes still register as enclosed polygons
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (45, 3))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 45))
+    bridged_h = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_h)
+    bridged_v = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_v)
+    combined = cv2.bitwise_or(bridged_h, bridged_v)
 
-    contours, _ = cv2.findContours(bridged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(combined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     raw_boxes = []
     for c in contours:
         area = cv2.contourArea(c)
@@ -173,11 +74,10 @@ def detect_cafe_rectangles(img_cv):
             continue
         bx, by, bw, bh = cv2.boundingRect(c)
         rect_fill = area / float(bw * bh) if (bw * bh) > 0 else 0
-        aspect = bw / float(bh) if bh > 0 else 0
-        if bw >= 30 and bh >= 22 and rect_fill > 0.62 and 0.15 <= aspect <= 7.5:
+        if bw > 30 and bh > 20 and rect_fill > 0.65:
             raw_boxes.append((bx, by, bw, bh))
 
-    raw_boxes.sort(key=box_area, reverse=True)
+    raw_boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
     unique_boxes = []
     for bx, by, bw, bh in raw_boxes:
         is_dup = False
@@ -188,6 +88,7 @@ def detect_cafe_rectangles(img_cv):
         if not is_dup:
             unique_boxes.append((bx, by, bw, bh))
 
+    # Discard any outer container box that wraps around other detected boxes
     inner_boxes = []
     for i, (bx, by, bw, bh) in enumerate(unique_boxes):
         contains_others = 0
@@ -197,35 +98,19 @@ def detect_cafe_rectangles(img_cv):
         if contains_others == 0:
             inner_boxes.append((bx, by, bw, bh))
 
-    inner_boxes.sort(key=box_top_y)
-    results = []
-    for box in inner_boxes:
-        entrance = detect_entrance_opening(thresh, box)
-        results.append((box, entrance))
-    return results
+    inner_boxes.sort(key=lambda b: b[1])
+    return inner_boxes
 
 
-def extract_dimensions(pil_img):
-    gray = np.array(pil_img.convert("L"))
-    bg = cv2.medianBlur(gray, 51)
-    norm = 255 - cv2.absdiff(gray, bg)
-    norm_pil = Image.fromarray(norm).convert("RGB")
-    enhanced = ImageEnhance.Contrast(norm_pil).enhance(2.2)
-    enhanced = ImageEnhance.Sharpness(enhanced).enhance(2.0)
-
+def extract_dimensions(norm_gray):
+    """Reads handwritten/printed dimension numbers and returns their pixel centers."""
+    rgb_for_ocr = cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2RGB)
+    ocr_results, _ = ocr(rgb_for_ocr)
     dimensions = []
-    ocr_results, _ = ocr(np.array(enhanced))
     if ocr_results:
         for item in ocr_results:
             bbox, text, _ = item
-            clean_text = (
-                str(text)
-                .replace(",", ".")
-                .replace("O", "0")
-                .replace("o", "0")
-                .replace("l", "1")
-                .replace("I", "1")
-            )
+            clean_text = str(text).replace(",", ".").replace("O", "0").replace("o", "0")
             for match in re.finditer(r"(\d+\.?\d*)", clean_text):
                 val = float(match.group(1))
                 if val > 100:
@@ -236,11 +121,18 @@ def extract_dimensions(pil_img):
     return dimensions
 
 
-def pick_best_dim(dimensions, target_x, target_y, fallback):
+def find_edge_dimension(dimensions, target_x, target_y, axis="horizontal", fallback=2.0):
+    """Finds the closest dimension aligned with a horizontal (width) or vertical (depth/gap) edge."""
     if not dimensions:
         return fallback
-    best = min(dimensions, key=lambda d: (d["x"] - target_x) ** 2 + (d["y"] - target_y) ** 2)
-    return best["val"]
+    scored = []
+    for d in dimensions:
+        dx = abs(d["x"] - target_x)
+        dy = abs(d["y"] - target_y)
+        penalty = (dx * 0.4 + dy * 1.6) if axis == "horizontal" else (dx * 1.6 + dy * 0.4)
+        scored.append((penalty, d["val"]))
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
 
 
 uploaded_file = st.file_uploader(
@@ -262,20 +154,21 @@ if uploaded_file:
     if w > 1400:
         pil_img = pil_img.resize((1400, int(h * (1400 / w))))
 
-    with st.spinner("Detecting pavement cafe zones, entrances, and dimensions..."):
+    with st.spinner("Detecting pavement cafe zones and reading dimensions..."):
         img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        zone_results = detect_cafe_rectangles(img_cv)
-        dimensions = extract_dimensions(pil_img)
+        norm_gray = normalize_lighting(img_cv)
+        boxes = detect_cafe_rectangles(norm_gray)
+        dimensions = extract_dimensions(norm_gray)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Uploaded Plan & Detection Overlay")
+        st.subheader("Uploaded Plan & Detected Zones")
         debug_img = pil_img.copy()
         debug_draw = ImageDraw.Draw(debug_img)
-        for idx, ((bx, by, bw, bh), ent) in enumerate(zone_results):
+        for idx, (bx, by, bw, bh) in enumerate(boxes):
             debug_draw.rectangle([bx, by, bx + bw, by + bh], outline="#16a34a", width=4)
-            tag = f"Zone {idx + 1}" + (f" (Entrance: {ent})" if ent != "None" else "")
-            debug_draw.text((bx + 5, max(5, by - 18)), tag, fill="#16a34a")
+            label_tag = "Remote PC" if (len(boxes) >= 2 and idx == 0) else "Adjacent PC"
+            debug_draw.text((bx + 6, by + 6), label_tag, fill="#16a34a")
         for d in dimensions:
             dx, dy = d["x"], d["y"]
             debug_draw.ellipse([dx - 5, dy - 5, dx + 5, dy + 5], fill="#dc2626")
@@ -283,42 +176,38 @@ if uploaded_file:
         st.image(debug_img, use_container_width=True)
         st.caption("Green boxes = detected PC zones | Red dots = numbers read by OCR")
 
-    adj_w, adj_d, adj_ent = 5.0, 2.0, "None"
-    has_remote, rem_w, rem_d, rem_ent, gap = False, 2.0, 2.0, "None", 2.0
+    adj_w, adj_d, has_remote, rem_w, rem_d, gap = 5.0, 2.0, False, 2.0, 2.0, 2.0
 
-    if zone_results:
-        (bx, by, bw, bh), adj_ent = zone_results[-1]
-        adj_w = pick_best_dim(dimensions, bx + bw / 2, by - 25, adj_w)
-        adj_d = pick_best_dim(dimensions, bx - 30, by + bh / 2, adj_d)
+    if boxes and dimensions:
+        bx, by, bw, bh = boxes[-1]
+        adj_w = find_edge_dimension(dimensions, bx + bw / 2, by, axis="horizontal", fallback=5.0)
+        adj_d = find_edge_dimension(dimensions, bx, by + bh / 2, axis="vertical", fallback=2.0)
 
-        if len(zone_results) >= 2:
+        if len(boxes) >= 2:
             has_remote = True
-            (rx, ry, rw, rh), rem_ent = next(iter(zone_results))
-            rem_w = pick_best_dim(dimensions, rx + rw / 2, ry - 25, rem_w)
-            rem_d = pick_best_dim(dimensions, rx + rw + 30, ry + rh / 2, rem_d)
+            rx, ry, rw, rh = boxes[0]
+            rem_w = find_edge_dimension(dimensions, rx + rw / 2, ry, axis="horizontal", fallback=2.0)
+            rem_d = find_edge_dimension(dimensions, rx + rw, ry + rh / 2, axis="vertical", fallback=2.0)
             gap_y = (ry + rh + by) / 2
-            gap = pick_best_dim(dimensions, min(bx, rx) - 35, gap_y, gap)
+            gap = find_edge_dimension(dimensions, rx, gap_y, axis="vertical", fallback=2.0)
 
     with col2:
         st.subheader("Dimensioned Polygon Output")
         detected_vals = [f"{d['val']}m" for d in dimensions]
         st.caption(
-            f"Detected {len(zone_results)} zone(s) | Numbers read: {', '.join(detected_vals) if detected_vals else 'None'}"
+            f"Detected {len(boxes)} zone(s) | Numbers read: {', '.join(detected_vals) if detected_vals else 'None'}"
         )
 
-        ent_options = ["None", "top", "bottom", "left", "right"]
-        c1, c2, c3 = st.columns(3)
-        adj_w = c1.number_input("Adjacent Width (m)", value=float(adj_w), min_value=0.1, step=0.1)
-        adj_d = c2.number_input("Adjacent Depth (m)", value=float(adj_d), min_value=0.1, step=0.1)
-        adj_ent = c3.selectbox("Adjacent Entrance", ent_options, index=ent_options.index(adj_ent))
+        c1, c2 = st.columns(2)
+        adj_w = c1.number_input("Adjacent PC Width (m)", value=float(adj_w), min_value=0.1, step=0.1)
+        adj_d = c2.number_input("Adjacent PC Depth (m)", value=float(adj_d), min_value=0.1, step=0.1)
 
         has_remote = st.checkbox("Include Remote PC", value=has_remote)
         if has_remote:
-            r1, r2, r3, r4 = st.columns(4)
-            rem_w = r1.number_input("Remote Width (m)", value=float(rem_w), min_value=0.1, step=0.1)
-            rem_d = r2.number_input("Remote Depth (m)", value=float(rem_d), min_value=0.1, step=0.1)
-            gap = r3.number_input("Separation Gap (m)", value=float(gap), min_value=0.1, step=0.1)
-            rem_ent = r4.selectbox("Remote Entrance", ent_options, index=ent_options.index(rem_ent))
+            c3, c4, c5 = st.columns(3)
+            rem_w = c3.number_input("Remote Width (m)", value=float(rem_w), min_value=0.1, step=0.1)
+            rem_d = c4.number_input("Remote Depth (m)", value=float(rem_d), min_value=0.1, step=0.1)
+            gap = c5.number_input("Separation Gap (m)", value=float(gap), min_value=0.1, step=0.1)
 
         total_w_m = max(adj_w, rem_w) if has_remote else adj_w
         total_h_m = (adj_d + gap + rem_d) if has_remote else adj_d
@@ -332,10 +221,12 @@ if uploaded_file:
         ay0 = ay1 - int(adj_d * scale)
         ax1 = ax0 + int(adj_w * scale)
 
+        # Building Frontage Line
         draw.line([(60, ay1), (740, ay1)], fill="black", width=4)
         draw.text((65, ay1 + 12), "PREMISES / BUILDING FRONTAGE", fill="black")
 
-        draw_zone_with_entrance(draw, (ax0, ay0, ax1, ay1), "#dbeafe", entrance_side=adj_ent)
+        # Fully Enclosed Adjacent PC Polygon
+        draw.rectangle([ax0, ay0, ax1, ay1], outline="black", fill="#dbeafe", width=3)
         adj_area = round(adj_w * adj_d, 2)
         draw.text((ax0 + 12, (ay0 + ay1) // 2 - 8), f"Adjacent PC ({adj_area} m²)", fill="black")
 
@@ -347,7 +238,8 @@ if uploaded_file:
             ry0 = ry1 - int(rem_d * scale)
             rx1 = ax0 + int(rem_w * scale)
 
-            draw_zone_with_entrance(draw, (ax0, ry0, rx1, ry1), "#fef3c7", entrance_side=rem_ent)
+            # Fully Enclosed Remote PC Polygon
+            draw.rectangle([ax0, ry0, rx1, ry1], outline="black", fill="#fef3c7", width=3)
             rem_area = round(rem_w * rem_d, 2)
             draw.text((ax0 + 12, (ry0 + ry1) // 2 - 8), f"Remote PC ({rem_area} m²)", fill="black")
 
